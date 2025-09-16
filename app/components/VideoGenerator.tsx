@@ -1,229 +1,209 @@
-'use client';
+"use client";
 
-import { useState, useEffect, useRef } from 'react';
-import { fal } from '@fal-ai/client';
+import React from "react";
 
-// Configure fal client to use the proxy
-fal.config({
-  proxyUrl: "/api/fal/proxy",
-});
-
-type QueueStatus = {
-  status: 'IN_QUEUE' | 'IN_PROGRESS' | 'COMPLETED' | 'FAILED';
-  logs?: Array<{ message: string }>;
-  request_id: string;
-};
-
-type VideoResponse = {
-  data: {
-    video: {
-      url: string;
-    };
-  };
+type JobBody = {
+  prompt: string;
+  width?: number;
+  height?: number;
+  num_frames?: number;
+  steps?: number;
+  guidance_scale?: number;
 };
 
 export default function VideoGenerator() {
-  const [image, setImage] = useState<File | null>(null);
-  const [prompt, setPrompt] = useState('');
-  const [isGenerating, setIsGenerating] = useState(false);
-  const [videoUrl, setVideoUrl] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [progress, setProgress] = useState<string>('');
-  const pollingTimeoutRef = useRef<NodeJS.Timeout | undefined>(undefined);
+  const [prompt, setPrompt] = React.useState(
+    "cinematic drone shot over tea fields at sunrise, mist, golden light"
+  );
 
-  // Cleanup polling on unmount
-  useEffect(() => {
-    return () => {
-      if (pollingTimeoutRef.current) {
-        clearTimeout(pollingTimeoutRef.current);
-      }
+  // Safe WAN defaults (divisible by 16; (frames-1)%4==0)
+  const [width, setWidth] = React.useState(960);
+  const [height, setHeight] = React.useState(544);
+  const [numFrames, setNumFrames] = React.useState(193); // ~8s @24fps
+  const [steps, setSteps] = React.useState(24);
+  const [guidance, setGuidance] = React.useState(4.0);
+
+  const [isRunning, setIsRunning] = React.useState(false);
+  const [status, setStatus] = React.useState<string | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+  const [videoUrl, setVideoUrl] = React.useState<string | null>(null);
+
+  function clamp16(n: number) {
+    return Math.max(16, Math.round(n / 16) * 16);
+  }
+  function fixFrames(n: number) {
+    // Make (n-1) divisible by 4
+    return Math.max(5, Math.round((n - 1) / 4) * 4 + 1);
+  }
+
+  async function runGeneration(input: JobBody) {
+    const body = {
+      prompt: input.prompt,
+      width: clamp16(input.width ?? width),
+      height: clamp16(input.height ?? height),
+      num_frames: fixFrames(input.num_frames ?? numFrames),
+      steps: input.steps ?? steps,
+      guidance_scale: input.guidance_scale ?? guidance,
     };
-  }, []);
 
-  const handleImageChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      setImage(file);
-      setError(null);
-    }
-  };
-
-  const fetchResult = async (id: string): Promise<VideoResponse> => {
-    return fal.queue.result('fal-ai/veo2/image-to-video', {
-      requestId: id,
+    const start = await fetch("/api/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
     });
-  };
 
-  const checkStatus = async (id: string) => {
-    try {
-      console.log('Checking status for request:', id);
-      const status = await fal.queue.status('fal-ai/veo2/image-to-video', {
-        requestId: id,
-        logs: true,
-      }) as QueueStatus;
-
-      console.log('Received status:', status);
-
-      if (status.status === 'COMPLETED') {
-        console.log('Generation completed, fetching result...');
-        try {
-          const response = await fetchResult(id);
-          console.log('Received result:', response);
-          
-          if (response.data?.video?.url) {
-            setVideoUrl(response.data.video.url);
-            setIsGenerating(false);
-            setProgress('Video generation completed!');
-          } else {
-            console.error('No video URL in result:', response);
-            setError('Video generation completed but no video URL was returned');
-            setIsGenerating(false);
-            setProgress('');
-          }
-        } catch (err) {
-          console.error('Error fetching result:', err);
-          setError('Failed to fetch video data');
-          setIsGenerating(false);
-          setProgress('');
-        }
-      } else if (status.status === 'FAILED') {
-        console.error('Generation failed:', status);
-        setError('Video generation failed');
-        setIsGenerating(false);
-        setProgress('');
-      } else if (status.status === 'IN_PROGRESS' || status.status === 'IN_QUEUE') {
-        const lastLog = status.logs?.[status.logs.length - 1]?.message;
-        console.log('Still processing, last log:', lastLog);
-        setProgress(lastLog || 'Processing...');
-        // Check again in 5 seconds
-        pollingTimeoutRef.current = setTimeout(() => checkStatus(id), 5000);
-      } else {
-        console.error('Unknown status:', status.status);
-        setError('Received unknown status from server');
-        setIsGenerating(false);
-        setProgress('');
-      }
-    } catch (err) {
-      console.error('Error checking status:', err);
-      setError(err instanceof Error ? err.message : 'Failed to check status');
-      setIsGenerating(false);
-      setProgress('');
+    if (!start.ok) {
+      throw new Error(`Start failed: ${await start.text()}`);
     }
-  };
+    const { job_id } = await start.json();
 
-  const handleSubmit = async (e: React.FormEvent) => {
+    let s = "running";
+    let err: string | undefined;
+    setStatus("running");
+
+    while (s === "running") {
+      await new Promise((r) => setTimeout(r, 1500));
+      const r = await fetch(`/api/jobs/${job_id}`, { cache: "no-store" });
+      const j = await r.json();
+      s = j.status;
+      err = j.error;
+      setStatus(s);
+    }
+
+    if (s !== "done") {
+      throw new Error(err ?? "Unknown error");
+    }
+
+    const v = await fetch(`/api/result/${job_id}`, { cache: "no-store" });
+    const blob = await v.blob();
+    return URL.createObjectURL(blob);
+  }
+
+  async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!image || !prompt) {
-      setError('Please provide both an image and a prompt');
-      return;
-    }
-
-    // Clear any existing polling
-    if (pollingTimeoutRef.current) {
-      clearTimeout(pollingTimeoutRef.current);
-    }
-
-    setIsGenerating(true);
+    setIsRunning(true);
     setError(null);
-    setProgress('Uploading image...');
+    setVideoUrl(null);
+    setStatus("queued");
 
     try {
-      // Upload the image first
-      const imageUrl = await fal.storage.upload(image);
-      setProgress('Starting video generation...');
-
-      // Submit to queue
-      const { request_id } = await fal.queue.submit('fal-ai/veo2/image-to-video', {
-        input: {
-          prompt,
-          image_url: imageUrl,
-          aspect_ratio: '16:9',
-          duration: '5s'
-        }
+      const url = await runGeneration({
+        prompt,
+        width,
+        height,
+        num_frames: numFrames,
+        steps,
+        guidance_scale: guidance,
       });
-
-      console.log('Submitted request with ID:', request_id);
-      // Start checking status
-      checkStatus(request_id);
-    } catch (err) {
-      console.error('Error submitting request:', err);
-      setError(err instanceof Error ? err.message : 'Failed to generate video');
-      setIsGenerating(false);
-      setProgress('');
+      setVideoUrl(url);
+      setStatus("done");
+    } catch (e: any) {
+      setError(String(e.message ?? e));
+      setStatus("error");
+    } finally {
+      setIsRunning(false);
     }
-  };
+  }
 
   return (
-    <div className="max-w-2xl mx-auto p-6">
-      <form onSubmit={handleSubmit} className="space-y-6">
-        <div>
-          <label className="block text-sm font-medium mb-2">
-            Upload Image
-          </label>
-          <input
-            type="file"
-            accept="image/*"
-            onChange={handleImageChange}
-            className="w-full p-2 border rounded-md"
-            disabled={isGenerating}
-          />
-          {image && (
-            <p className="mt-2 text-sm text-gray-600">
-              Selected: {image.name}
-            </p>
-          )}
-        </div>
+    <div className="mx-auto max-w-3xl p-6 space-y-6">
+      <h1 className="text-2xl font-semibold">WAN 2.2 Video Generator (UI)</h1>
 
-        <div>
-          <label className="block text-sm font-medium mb-2">
-            Animation Prompt
-          </label>
+      <form onSubmit={onSubmit} className="space-y-4">
+        <label className="block">
+          <span className="text-sm font-medium">Prompt</span>
           <textarea
+            className="mt-1 w-full rounded-xl border p-3"
+            rows={4}
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
-            placeholder="Describe how you want the image to be animated..."
-            className="w-full p-2 border rounded-md h-32"
-            disabled={isGenerating}
           />
+        </label>
+
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+          <label className="text-sm">
+            Width
+            <input
+              type="number"
+              className="mt-1 w-full rounded-xl border p-2"
+              value={width}
+              onChange={(e) => setWidth(clamp16(Number(e.target.value)))}
+            />
+          </label>
+
+          <label className="text-sm">
+            Height
+            <input
+              type="number"
+              className="mt-1 w-full rounded-xl border p-2"
+              value={height}
+              onChange={(e) => setHeight(clamp16(Number(e.target.value)))}
+            />
+          </label>
+
+          <label className="text-sm">
+            Frames
+            <input
+              type="number"
+              className="mt-1 w-full rounded-xl border p-2"
+              value={numFrames}
+              onChange={(e) => setNumFrames(fixFrames(Number(e.target.value)))}
+            />
+          </label>
+
+          <label className="text-sm">
+            Steps
+            <input
+              type="number"
+              className="mt-1 w-full rounded-xl border p-2"
+              value={steps}
+              onChange={(e) => setSteps(Number(e.target.value))}
+            />
+          </label>
+
+          <label className="text-sm">
+            Guidance
+            <input
+              type="number"
+              step="0.1"
+              className="mt-1 w-full rounded-xl border p-2"
+              value={guidance}
+              onChange={(e) => setGuidance(Number(e.target.value))}
+            />
+          </label>
         </div>
 
         <button
           type="submit"
-          disabled={isGenerating || !image || !prompt}
-          className={`w-full py-2 px-4 rounded-md text-white font-medium
-            ${isGenerating || !image || !prompt
-              ? 'bg-gray-400 cursor-not-allowed'
-              : 'bg-indigo-600 hover:bg-indigo-700'
-            }`}
+          disabled={isRunning}
+          className="rounded-xl bg-black text-white px-4 py-2 disabled:opacity-60"
         >
-          {isGenerating ? 'Generating Video...' : 'Generate Video'}
+          {isRunning ? "Generating…" : "Generate"}
         </button>
       </form>
 
+      {status && (
+        <div className="text-sm">
+          <b>Status:</b> {status}
+        </div>
+      )}
       {error && (
-        <div className="mt-4 p-4 bg-red-50 text-red-700 rounded-md">
-          {error}
+        <div className="text-sm text-red-600">
+          <b>Error:</b> {error}
         </div>
       )}
-
-      {progress && (
-        <div className="mt-4 p-4 bg-blue-50 text-blue-700 rounded-md">
-          {progress}
-        </div>
-      )}
-
       {videoUrl && (
-        <div className="mt-6">
-          <h3 className="text-lg font-medium mb-2">Generated Video</h3>
-          <video
-            controls
-            className="w-full rounded-lg"
-            src={videoUrl}
-          >
-            Your browser does not support the video tag.
-          </video>
-        </div>
+        <video
+          src={videoUrl}
+          controls
+          className="w-full rounded-xl border"
+          autoPlay
+          playsInline
+        />
       )}
+      <p className="text-xs text-gray-500">
+        Rules enforced: width/height divisible by 16; (frames − 1) divisible by 4.
+      </p>
     </div>
   );
-} 
+}
